@@ -315,12 +315,12 @@ def _check_build_environment():
 
 
 def _find_single_run_package():
-    run_files = sorted((REPO_ROOT / "build_out").glob("fla-npu-*.run"))
+    run_files = sorted((REPO_ROOT / "build_out").glob("fla_npu_linux-*.run"))
     if not run_files:
-        raise RuntimeError("No fla-npu-*.run package found in build_out")
+        raise RuntimeError("No fla_npu_linux-*.run package found in build_out")
     if len(run_files) > 1:
         raise RuntimeError(
-            "Multiple fla-npu-*.run packages found in build_out: "
+            "Multiple fla_npu_linux-*.run packages found in build_out: "
             + ", ".join(str(path) for path in run_files)
         )
     return run_files[0]
@@ -566,6 +566,11 @@ class FlaNpuBuildPy(_build_py):
         super().run()
         run_package = _RUN_PACKAGE or _find_single_run_package()
         _stage_run_package(run_package, Path(self.build_lib) / "fla_npu" / "opp")
+        opp_env_src = REPO_ROOT / "torch_custom" / "fla_npu"
+        for name in ("fla_npu_opp_env.py", "fla_npu_opp_env.pth"):
+            src = opp_env_src / name
+            if src.exists():
+                shutil.copyfile(str(src), str(Path(self.build_lib) / name))
 
 
 class BinaryDistribution(Distribution):
