@@ -1237,6 +1237,8 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::ProcessDefaultByWindowMode()
     }
 
     const int64_t gridSize = static_cast<int64_t>(batch) * baseDimCnt;
+    const bool reuseWeight = kIsUpdateMode && baseDimCnt == 1;
+    bool weightLoaded = false;
     for (int64_t task = static_cast<int64_t>(blockIdx); task < gridSize; task += static_cast<int64_t>(blockNum)) {
         const int32_t seq = static_cast<int32_t>(task / baseDimCnt);
         const int32_t baseDimIdx = static_cast<int32_t>(task % baseDimCnt);
@@ -1269,7 +1271,10 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::ProcessDefaultByWindowMode()
             }
         }
 
-        LoadWeightAndBias(channelStart, curBaseDim);
+        if (!reuseWeight || !weightLoaded) {
+            LoadWeightAndBias(channelStart, curBaseDim);
+            weightLoaded = true;
+        }
 
         InitRing(cacheIdx, hasInit, stateTokenOffset, start, len, channelStart, curBaseDim, dim);
         RunSeq(start, len, channelStart, curBaseDim, dim);
