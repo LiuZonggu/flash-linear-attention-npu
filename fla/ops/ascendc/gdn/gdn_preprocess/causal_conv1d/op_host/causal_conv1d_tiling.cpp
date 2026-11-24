@@ -27,7 +27,8 @@ static ge::graphStatus CausalConv1dTilingFunc(gert::TilingContext *context)
 {
     uint64_t ubSize = 0;
     uint32_t coreNum = 0;
-    if (GetPlatformInfo(context, ubSize, coreNum) != ge::GRAPH_SUCCESS) {
+    uint64_t libApiWorkspaceSize = 0;
+    if (GetPlatformInfo(context, ubSize, coreNum, libApiWorkspaceSize) != ge::GRAPH_SUCCESS) {
         OP_LOGE_WITHOUT_REPORT(context->GetNodeName(), "%s: GetPlatformInfo error", __func__);
         return ge::GRAPH_FAILED;
     }
@@ -159,7 +160,7 @@ static ge::graphStatus CausalConv1dTilingFunc(gert::TilingContext *context)
         const int64_t syncWorkspaceSize = static_cast<int64_t>(blockDim) * kSyncBytesPerBlock;
         const int64_t snapshotWorkspaceSize = tiling->batch * historyCount * tiling->dim * kDtypeSize;
         const int64_t workspaceSize =
-            ASCENDC_RESERVED_WORKSPACE_SIZE + syncWorkspaceSize + snapshotWorkspaceSize;
+            static_cast<int64_t>(libApiWorkspaceSize) + syncWorkspaceSize + snapshotWorkspaceSize;
         if (SetWorkspaceSize(context, static_cast<size_t>(workspaceSize)) != ge::GRAPH_SUCCESS) {
         OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(context->GetNodeName(), "size", "invalid", "SetWorkspaceSize error");
         return ge::GRAPH_FAILED;

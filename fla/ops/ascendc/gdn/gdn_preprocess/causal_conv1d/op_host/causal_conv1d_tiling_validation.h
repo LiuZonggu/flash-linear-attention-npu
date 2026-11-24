@@ -18,6 +18,7 @@
 #include <cstring>
 #include <limits>
 
+#include "platform/platform_info.h"
 #include "platform/platform_infos_def.h"
 #include "causal_conv1d_tiling_utils.h"
 #include "../op_kernel/causal_conv1d_tiling_data.h"
@@ -27,7 +28,8 @@ namespace optiling::causal_conv1d_host {
 
 using namespace Ops::Transformer::OpTiling;
 
-inline ge::graphStatus GetPlatformInfo(gert::TilingContext *context, uint64_t &ubSize, uint32_t &coreNum)
+inline ge::graphStatus GetPlatformInfo(gert::TilingContext *context, uint64_t &ubSize, uint32_t &coreNum,
+                                       uint64_t &libApiWorkspaceSize)
 {
     fe::PlatFormInfos *platformInfoPtr = context->GetPlatformInfo();
     OP_CHECK_NULL_WITH_CONTEXT(context, platformInfoPtr);
@@ -41,6 +43,8 @@ inline ge::graphStatus GetPlatformInfo(gert::TilingContext *context, uint64_t &u
         OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(context->GetNodeName(), "ubSize", std::to_string(ubSize), "ubSize is 0");
         return ge::GRAPH_FAILED;
     }
+    libApiWorkspaceSize =
+        static_cast<uint64_t>(platform_ascendc::PlatformAscendC(platformInfoPtr).GetLibApiWorkSpaceSize());
     return ge::GRAPH_SUCCESS;
 }
 

@@ -45,8 +45,6 @@ constexpr int64_t METADATA_DTYPE_INT64 = 0;
 constexpr int64_t METADATA_DTYPE_INT32 = 1;
 constexpr int64_t METADATA_DTYPE_BOOL = 2;
 
-constexpr int64_t ASCENDC_RESERVED_WORKSPACE_SIZE = 16 * 1024 * 1024;
-
 struct CausalConv1dCompileInfo {
     uint64_t ubSize = 0;
     uint32_t coreNum = 0;
