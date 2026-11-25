@@ -123,44 +123,53 @@ inline DimTileChoice ChooseFnTokenDimCoSplitBaseDimChoice(gert::TilingContext *c
         return {};
     }
 
+    // Split the dim range into equally sized column tiles instead of filling
+    // the leading tile up to the UB limit: with one max-size tile plus a small
+    // tail tile, the AIVs owning the tail only get a fraction of the work of
+    // the others and the kernel finishes at the speed of the max-size tile.
+    const int64_t minBaseDimCnt = std::max<int64_t>(1, CeilDivInt64(dim, ubLimitedBaseDim));
+    if (minBaseDimCnt > static_cast<int64_t>(coreNum)) {
+        OP_LOGD(context,
+                "FnDimCoSplit: dim[%ld] needs at least %ld column tiles but coreNum[%u] cannot cover them.",
+                dim, minBaseDimCnt, coreNum);
+        return {};
+    }
+
+    auto buildChoice = [&](int64_t baseDimCnt) -> DimTileChoice {
+        DimTileChoice choice;
+        choice.baseDim = AlignUpInt64(CeilDivInt64(dim, baseDimCnt), DIM_ALIGN_ELEMS);
+        if (choice.baseDim <= 0 || choice.baseDim > ubLimitedBaseDim) {
+            return {};
+        }
+        choice.baseDimCnt = CeilDivInt64(dim, choice.baseDim);
+        choice.gridSize = choice.baseDimCnt;
+        return choice;
+    };
+
+    // Prefer the smallest tile count that divides coreNum so every AIV gets an
+    // integer token budget and the whole grid is covered by coreNum blocks.
     DimTileChoice result;
-    result.baseDim = ubLimitedBaseDim;
-    result.baseDimCnt = CeilDivInt64(dim, result.baseDim);
-    result.gridSize = result.baseDimCnt;
-
-    if (coreNum == 0 || result.baseDimCnt <= 1 || result.baseDimCnt >= static_cast<int64_t>(coreNum) ||
-        (coreNum % result.baseDimCnt == 0)) {
-        OP_LOGD(context,
-                "FnDimCoSplit: dim[%ld], ubLimitedBaseDim[%ld], baseDimCnt[%ld], coreNum[%u], adjusted[%d].", dim,
-                result.baseDim, result.baseDimCnt, coreNum, 0);
-        return result;
+    for (int64_t baseDimCnt = minBaseDimCnt; baseDimCnt <= static_cast<int64_t>(coreNum); ++baseDimCnt) {
+        if (coreNum % baseDimCnt != 0) {
+            continue;
+        }
+        result = buildChoice(baseDimCnt);
+        if (result.baseDim > 0) {
+            break;
+        }
+    }
+    if (result.baseDim == 0) {
+        result = buildChoice(minBaseDimCnt);
+        if (result.baseDim <= 0) {
+            OP_LOGD(context,
+                    "FnDimCoSplit: dim[%ld], minBaseDimCnt[%ld], ubLimitedBaseDim[%ld] cannot form a valid split.",
+                    dim, minBaseDimCnt, ubLimitedBaseDim);
+            return {};
+        }
     }
 
-    int64_t adjustedBaseDimCnt = result.baseDimCnt;
-    while (adjustedBaseDimCnt < static_cast<int64_t>(coreNum) && (coreNum % adjustedBaseDimCnt != 0)) {
-        ++adjustedBaseDimCnt;
-    }
-
-    if (adjustedBaseDimCnt >= static_cast<int64_t>(coreNum)) {
-        OP_LOGD(context,
-                "FnDimCoSplit: keep baseDimCnt[%ld] because no divisible adjustment exists under coreNum[%u].",
-                result.baseDimCnt, coreNum);
-        return result;
-    }
-
-    const int64_t adjustedBaseDim = AlignUpInt64(CeilDivInt64(dim, adjustedBaseDimCnt), DIM_ALIGN_ELEMS);
-    if (adjustedBaseDim <= 0 || adjustedBaseDim > ubLimitedBaseDim || adjustedBaseDim > MAX_DIM_TILE_SIZE) {
-        OP_LOGD(context,
-                "FnDimCoSplit: rejected adjusted baseDim[%ld] with baseDimCnt[%ld], ubLimitedBaseDim[%ld].",
-                adjustedBaseDim, adjustedBaseDimCnt, ubLimitedBaseDim);
-        return result;
-    }
-
-    result.baseDim = adjustedBaseDim;
-    result.baseDimCnt = CeilDivInt64(dim, result.baseDim);
-    result.gridSize = result.baseDimCnt;
     OP_LOGD(context,
-            "FnDimCoSplit: dim[%ld], ubLimitedBaseDim[%ld], adjustedBaseDim[%ld], baseDimCnt[%ld], coreNum[%u].",
+            "FnDimCoSplit: dim[%ld], ubLimitedBaseDim[%ld], baseDim[%ld], baseDimCnt[%ld], coreNum[%u].",
             dim, ubLimitedBaseDim, result.baseDim, result.baseDimCnt, coreNum);
     return result;
 }
