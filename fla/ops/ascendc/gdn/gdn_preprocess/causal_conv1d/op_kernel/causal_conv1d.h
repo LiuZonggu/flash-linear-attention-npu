@@ -226,20 +226,33 @@ protected:
     GlobalTensor<T> initStateWorkspaceGm_;
 
     const CausalConv1dTilingData *tilingData_{nullptr};
+    int32_t tileStep_{0};
+
+    __aicore__ inline int32_t TileStep() const
+    {
+        if constexpr (kIsUpdateMode) {
+            return MAX_BLOCK_DIM;
+        }
+        return tileStep_;
+    }
 };
 
 template <CAUSAL_CONV1D_TEMPLATE_ARGS>
 __aicore__ inline void CAUSAL_CONV1D_CLASS::ResetRuntimeState(const CausalConv1dTilingData *tilingData)
 {
     tilingData_ = tilingData;
+    tileStep_ = (tilingData != nullptr) ? static_cast<int32_t>(tilingData->baseDim) : 0;
+    if (tileStep_ <= 0) {
+        tileStep_ = TILE_STEP_ALIGN;
+    }
 }
 
 template <CAUSAL_CONV1D_TEMPLATE_ARGS>
 __aicore__ inline void CAUSAL_CONV1D_CLASS::InitSharedBuffersAndEvents()
 {
-    pipe.InitBuffer(inBuf, RING_SLOTS * MAX_BLOCK_DIM * sizeof(T));
-    pipe.InitBuffer(outBuf, 2 * MAX_BLOCK_DIM * sizeof(T));
-    pipe.InitBuffer(calcBuf, (MAX_WIDTH + 4) * MAX_BLOCK_DIM * sizeof(float));
+    pipe.InitBuffer(inBuf, RING_SLOTS * TileStep() * sizeof(T));
+    pipe.InitBuffer(outBuf, 2 * TileStep() * sizeof(T));
+    pipe.InitBuffer(calcBuf, (MAX_WIDTH + 4) * TileStep() * sizeof(float));
     AllocEvents();
 }
 
@@ -310,7 +323,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::LoadWeightAndBias(int32_t channelSta
     const int32_t width = static_cast<int32_t>(tilingData_->width);
     const int32_t jStart = MAX_WIDTH - width;
     const bool hasBias = HasBias();
-    auto cl = CalcBufLayout::FromCalcBuf(calcBuf);
+    auto cl = CalcBufLayout::FromCalcBuf(calcBuf, TileStep());
     LocalTensor<float> &weightF = cl.weightF;
     LocalTensor<float> &biasF = cl.biasF;
     LocalTensor<T> weightT;
@@ -319,11 +332,11 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::LoadWeightAndBias(int32_t channelSta
     if constexpr (!std::is_same<T, float>::value) {
 
         weightT = inBuf.Get<T>();
-        biasT = weightT[MAX_WIDTH * MAX_BLOCK_DIM];
+        biasT = weightT[MAX_WIDTH * TileStep()];
     }
 
     for (int32_t j = 0; j < jStart; ++j) {
-        Duplicate(weightF[j * MAX_BLOCK_DIM], 0.0f, baseDim);
+        Duplicate(weightF[j * TileStep()], 0.0f, baseDim);
     }
 
     for (int32_t j = 0; j < width; ++j) {
@@ -331,9 +344,9 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::LoadWeightAndBias(int32_t channelSta
         const int64_t weightOffset = static_cast<int64_t>(j) * dim + channelStart;
 
         if constexpr (std::is_same<T, float>::value) {
-            DataCopy(weightF[jDst * MAX_BLOCK_DIM], weightGm[weightOffset], baseDim);
+            DataCopy(weightF[jDst * TileStep()], weightGm[weightOffset], baseDim);
         } else {
-            DataCopy(weightT[jDst * MAX_BLOCK_DIM], weightGm[weightOffset], baseDim);
+            DataCopy(weightT[jDst * TileStep()], weightGm[weightOffset], baseDim);
         }
     }
 
@@ -351,7 +364,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::LoadWeightAndBias(int32_t channelSta
     if constexpr (!std::is_same<T, float>::value) {
         for (int32_t j = 0; j < width; ++j) {
             const int32_t jDst = jStart + j;
-            Cast(weightF[jDst * MAX_BLOCK_DIM], weightT[jDst * MAX_BLOCK_DIM], RoundMode::CAST_NONE, baseDim);
+            Cast(weightF[jDst * TileStep()], weightT[jDst * TileStep()], RoundMode::CAST_NONE, baseDim);
         }
         if (hasBias) {
             Cast(biasF, biasT, RoundMode::CAST_NONE, baseDim);
@@ -383,7 +396,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRing(int32_t cacheIdx, bool hasI
     LocalTensor<T> ring = inBuf.Get<T>();
 
     for (int32_t i = 0; i < ringStart; ++i) {
-        Duplicate(ring[i * MAX_BLOCK_DIM], static_cast<T>(0), baseDim);
+        Duplicate(ring[i * TileStep()], static_cast<T>(0), baseDim);
     }
     if (ringStart > 0) {
         PipeBarrier<PIPE_V>();
@@ -394,14 +407,14 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRing(int32_t cacheIdx, bool hasI
             const int32_t pos = stateTokenOffset + i;
             const int64_t stateOffset = static_cast<int64_t>(cacheIdx) * convStateStride0 +
                                         static_cast<int64_t>(pos) * convStateStride1 + channelStart;
-            DataCopy(ring[(ringStart + i) * MAX_BLOCK_DIM], convStatesGm[stateOffset], baseDim);
+            DataCopy(ring[(ringStart + i) * TileStep()], convStatesGm[stateOffset], baseDim);
         }
 
         SetFlag<HardEvent::MTE2_V>(stateMte2ToVEvent_);
         WaitFlag<HardEvent::MTE2_V>(stateMte2ToVEvent_);
     } else {
         for (int32_t i = 0; i < (width - 1); ++i) {
-            Duplicate(ring[(ringStart + i) * MAX_BLOCK_DIM], static_cast<T>(0), baseDim);
+            Duplicate(ring[(ringStart + i) * TileStep()], static_cast<T>(0), baseDim);
         }
 
         PipeBarrier<PIPE_V>();
@@ -410,7 +423,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRing(int32_t cacheIdx, bool hasI
     if (len > 0) {
         const int32_t slot0 = SlotCurr(0);
         const int64_t xOffset = static_cast<int64_t>(start) * dim + channelStart;
-        DataCopy(ring[slot0 * MAX_BLOCK_DIM], xGm[xOffset], baseDim);
+        DataCopy(ring[slot0 * TileStep()], xGm[xOffset], baseDim);
 
         SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slot0]);
     }
@@ -472,7 +485,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
 
     const int32_t width = static_cast<int32_t>(tilingData_->width);
     const int32_t jStart = MAX_WIDTH - width;
-    auto cl = CalcBufLayout::FromCalcBuf(calcBuf);
+    auto cl = CalcBufLayout::FromCalcBuf(calcBuf, TileStep());
     LocalTensor<float> &weightF = cl.weightF;
     LocalTensor<float> &biasF = cl.biasF;
     LocalTensor<float> &accF = cl.accF;
@@ -490,7 +503,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
             const int32_t slotNext = SlotPrefetch(t);
             const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * dim + channelStart;
             WaitFlag<HardEvent::V_MTE2>(inputVToMte2Event_);
-            DataCopy(ring[slotNext * MAX_BLOCK_DIM], xGm[xOffsetNext], baseDim);
+            DataCopy(ring[slotNext * TileStep()], xGm[xOffsetNext], baseDim);
             SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slotNext]);
         }
 
@@ -505,13 +518,13 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
         for (int32_t j = jStart; j < MAX_WIDTH; ++j) {
             const int32_t tap = (MAX_WIDTH - 1) - j;
             const int32_t slot = (tap == 0) ? slotCurr : SlotHist(t, tap);
-            Cast(tmpF, ring[slot * MAX_BLOCK_DIM], RoundMode::CAST_NONE, baseDim);
+            Cast(tmpF, ring[slot * TileStep()], RoundMode::CAST_NONE, baseDim);
             PipeBarrier<PIPE_V>();
             if (!accInitialized) {
-                Mul(accF, tmpF, weightF[j * MAX_BLOCK_DIM], baseDim);
+                Mul(accF, tmpF, weightF[j * TileStep()], baseDim);
                 accInitialized = true;
             } else {
-                MulAddDst(accF, tmpF, weightF[j * MAX_BLOCK_DIM], baseDim);
+                MulAddDst(accF, tmpF, weightF[j * TileStep()], baseDim);
             }
         }
 
@@ -522,7 +535,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
         }
 
         const int32_t outSlot = t & 1;
-        LocalTensor<T> outSlotT = outT[outSlot * MAX_BLOCK_DIM];
+        LocalTensor<T> outSlotT = outT[outSlot * TileStep()];
         if (t >= 2) {
 
             WaitFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
@@ -564,7 +577,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RestoreFnLocalPartials(int32_t baseD
         return;
     }
 
-    auto cl = CalcBufLayout::FromCalcBuf(calcBuf);
+    auto cl = CalcBufLayout::FromCalcBuf(calcBuf, TileStep());
     LocalTensor<float> &weightF = cl.weightF;
     LocalTensor<float> &state2F = cl.biasF;
     LocalTensor<float> &state1F = cl.accF;
@@ -575,54 +588,54 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RestoreFnLocalPartials(int32_t baseD
     constexpr int32_t w0Idx = MAX_WIDTH - kTemplateWidth;
 
 #if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510 || __NPU_ARCH__ == 9201)
-    RestoreFnLocalPartialsRegbase<T, kTemplateWidth>(ring[ringStart * MAX_BLOCK_DIM],
-                                                     weightF[w0Idx * MAX_BLOCK_DIM], state0F, state1F, state2F,
-                                                     baseDim, MAX_BLOCK_DIM);
+    RestoreFnLocalPartialsRegbase<T, kTemplateWidth>(ring[ringStart * TileStep()],
+                                                     weightF[w0Idx * TileStep()], state0F, state1F, state2F,
+                                                     baseDim, TileStep());
 #else
     if constexpr (kTemplateWidth == 2) {
         Duplicate(state2F, 0.0f, baseDim);
         Duplicate(state1F, 0.0f, baseDim);
         PipeBarrier<PIPE_V>();
 
-        Cast(currF, ring[ringStart * MAX_BLOCK_DIM], RoundMode::CAST_NONE, baseDim);
+        Cast(currF, ring[ringStart * TileStep()], RoundMode::CAST_NONE, baseDim);
         PipeBarrier<PIPE_V>();
-        Mul(state0F, currF, weightF[w0Idx * MAX_BLOCK_DIM], baseDim);
+        Mul(state0F, currF, weightF[w0Idx * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
     } else if constexpr (kTemplateWidth == 3) {
         Duplicate(state2F, 0.0f, baseDim);
         PipeBarrier<PIPE_V>();
 
-        Cast(currF, ring[ringStart * MAX_BLOCK_DIM], RoundMode::CAST_NONE, baseDim);
+        Cast(currF, ring[ringStart * TileStep()], RoundMode::CAST_NONE, baseDim);
         PipeBarrier<PIPE_V>();
-        Mul(state0F, currF, weightF[w0Idx * MAX_BLOCK_DIM], baseDim);
+        Mul(state0F, currF, weightF[w0Idx * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
 
-        Cast(currF, ring[(ringStart + 1) * MAX_BLOCK_DIM], RoundMode::CAST_NONE, baseDim);
+        Cast(currF, ring[(ringStart + 1) * TileStep()], RoundMode::CAST_NONE, baseDim);
         PipeBarrier<PIPE_V>();
-        Mul(state1F, currF, weightF[w0Idx * MAX_BLOCK_DIM], baseDim);
+        Mul(state1F, currF, weightF[w0Idx * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
-        MulAddDst(state0F, currF, weightF[(w0Idx + 1) * MAX_BLOCK_DIM], baseDim);
+        MulAddDst(state0F, currF, weightF[(w0Idx + 1) * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
     } else if constexpr (kTemplateWidth == 4) {
-        Cast(currF, ring[ringStart * MAX_BLOCK_DIM], RoundMode::CAST_NONE, baseDim);
+        Cast(currF, ring[ringStart * TileStep()], RoundMode::CAST_NONE, baseDim);
         PipeBarrier<PIPE_V>();
-        Mul(state0F, currF, weightF[w0Idx * MAX_BLOCK_DIM], baseDim);
-        PipeBarrier<PIPE_V>();
-
-        Cast(currF, ring[(ringStart + 1) * MAX_BLOCK_DIM], RoundMode::CAST_NONE, baseDim);
-        PipeBarrier<PIPE_V>();
-        Mul(state1F, currF, weightF[w0Idx * MAX_BLOCK_DIM], baseDim);
-        PipeBarrier<PIPE_V>();
-        MulAddDst(state0F, currF, weightF[(w0Idx + 1) * MAX_BLOCK_DIM], baseDim);
+        Mul(state0F, currF, weightF[w0Idx * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
 
-        Cast(currF, ring[(ringStart + 2) * MAX_BLOCK_DIM], RoundMode::CAST_NONE, baseDim);
+        Cast(currF, ring[(ringStart + 1) * TileStep()], RoundMode::CAST_NONE, baseDim);
         PipeBarrier<PIPE_V>();
-        Mul(state2F, currF, weightF[w0Idx * MAX_BLOCK_DIM], baseDim);
+        Mul(state1F, currF, weightF[w0Idx * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
-        MulAddDst(state1F, currF, weightF[(w0Idx + 1) * MAX_BLOCK_DIM], baseDim);
+        MulAddDst(state0F, currF, weightF[(w0Idx + 1) * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
-        MulAddDst(state0F, currF, weightF[(w0Idx + 2) * MAX_BLOCK_DIM], baseDim);
+
+        Cast(currF, ring[(ringStart + 2) * TileStep()], RoundMode::CAST_NONE, baseDim);
+        PipeBarrier<PIPE_V>();
+        Mul(state2F, currF, weightF[w0Idx * TileStep()], baseDim);
+        PipeBarrier<PIPE_V>();
+        MulAddDst(state1F, currF, weightF[(w0Idx + 1) * TileStep()], baseDim);
+        PipeBarrier<PIPE_V>();
+        MulAddDst(state0F, currF, weightF[(w0Idx + 2) * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
     }
 #endif
@@ -635,7 +648,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::ComputeFnRollingOutput(int32_t slotC
         return;
     }
 
-    auto cl = CalcBufLayout::FromCalcBuf(calcBuf);
+    auto cl = CalcBufLayout::FromCalcBuf(calcBuf, TileStep());
     LocalTensor<float> &weightF = cl.weightF;
     LocalTensor<float> &state0F = cl.tmpF;
     LocalTensor<float> &currF = cl.currF;
@@ -644,16 +657,16 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::ComputeFnRollingOutput(int32_t slotC
 #if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510 || __NPU_ARCH__ == 9201)
     const bool hasActivation = HasActivation();
     if (hasActivation) {
-        ComputeFnRollingOutputRegbase<T, true>(ring[slotCurr * MAX_BLOCK_DIM], currF, state0F,
-                                               weightF[3 * MAX_BLOCK_DIM], baseDim);
+        ComputeFnRollingOutputRegbase<T, true>(ring[slotCurr * TileStep()], currF, state0F,
+                                               weightF[3 * TileStep()], baseDim);
     } else {
-        ComputeFnRollingOutputRegbase<T, false>(ring[slotCurr * MAX_BLOCK_DIM], currF, state0F,
-                                                weightF[3 * MAX_BLOCK_DIM], baseDim);
+        ComputeFnRollingOutputRegbase<T, false>(ring[slotCurr * TileStep()], currF, state0F,
+                                                weightF[3 * TileStep()], baseDim);
     }
 #else
-    Cast(currF, ring[slotCurr * MAX_BLOCK_DIM], RoundMode::CAST_NONE, baseDim);
+    Cast(currF, ring[slotCurr * TileStep()], RoundMode::CAST_NONE, baseDim);
     PipeBarrier<PIPE_V>();
-    MulAddDst(state0F, currF, weightF[3 * MAX_BLOCK_DIM], baseDim);
+    MulAddDst(state0F, currF, weightF[3 * TileStep()], baseDim);
     PipeBarrier<PIPE_V>();
 
     const bool hasActivation = HasActivation();
@@ -672,7 +685,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::AdvanceFnLocalPartials(int32_t slotC
         return;
     }
 
-    auto cl = CalcBufLayout::FromCalcBuf(calcBuf);
+    auto cl = CalcBufLayout::FromCalcBuf(calcBuf, TileStep());
     LocalTensor<float> &weightF = cl.weightF;
     LocalTensor<float> &state2F = cl.biasF;
     LocalTensor<float> &state1F = cl.accF;
@@ -682,36 +695,36 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::AdvanceFnLocalPartials(int32_t slotC
     constexpr int32_t w0Idx = MAX_WIDTH - kTemplateWidth;
 
 #if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510 || __NPU_ARCH__ == 9201)
-    AdvanceFnLocalPartialsRegbase<T, kTemplateWidth>(ring[slotCurr * MAX_BLOCK_DIM],
-                                                     weightF[w0Idx * MAX_BLOCK_DIM], state0F, state1F, state2F,
-                                                     baseDim, MAX_BLOCK_DIM);
+    AdvanceFnLocalPartialsRegbase<T, kTemplateWidth>(ring[slotCurr * TileStep()],
+                                                     weightF[w0Idx * TileStep()], state0F, state1F, state2F,
+                                                     baseDim, TileStep());
 #else
-    Cast(currF, ring[slotCurr * MAX_BLOCK_DIM], RoundMode::CAST_NONE, baseDim);
+    Cast(currF, ring[slotCurr * TileStep()], RoundMode::CAST_NONE, baseDim);
     PipeBarrier<PIPE_V>();
 
     if constexpr (kTemplateWidth == 2) {
-        Mul(state0F, currF, weightF[w0Idx * MAX_BLOCK_DIM], baseDim);
+        Mul(state0F, currF, weightF[w0Idx * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
     } else if constexpr (kTemplateWidth == 3) {
-        Mul(state0F, currF, weightF[(w0Idx + 1) * MAX_BLOCK_DIM], baseDim);
+        Mul(state0F, currF, weightF[(w0Idx + 1) * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
         Add(state0F, state0F, state1F, baseDim);
         PipeBarrier<PIPE_V>();
 
-        Mul(state1F, currF, weightF[w0Idx * MAX_BLOCK_DIM], baseDim);
+        Mul(state1F, currF, weightF[w0Idx * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
     } else if constexpr (kTemplateWidth == 4) {
-        Mul(state0F, currF, weightF[(w0Idx + 2) * MAX_BLOCK_DIM], baseDim);
+        Mul(state0F, currF, weightF[(w0Idx + 2) * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
         Add(state0F, state0F, state1F, baseDim);
         PipeBarrier<PIPE_V>();
 
-        Mul(state1F, currF, weightF[(w0Idx + 1) * MAX_BLOCK_DIM], baseDim);
+        Mul(state1F, currF, weightF[(w0Idx + 1) * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
         Add(state1F, state1F, state2F, baseDim);
         PipeBarrier<PIPE_V>();
 
-        Mul(state2F, currF, weightF[w0Idx * MAX_BLOCK_DIM], baseDim);
+        Mul(state2F, currF, weightF[w0Idx * TileStep()], baseDim);
         PipeBarrier<PIPE_V>();
     }
 #endif
@@ -729,18 +742,18 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::CopyFnRollingInputBatch(int32_t star
     const int64_t xOffset = static_cast<int64_t>(start + firstToken) * dim + channelStart;
     const int32_t blockLen = baseDim * static_cast<int32_t>(sizeof(T)) / 32;
     const int32_t srcStride = (dim - baseDim) * static_cast<int32_t>(sizeof(T)) / 32;
-    const int32_t dstStride = (MAX_BLOCK_DIM - baseDim) * static_cast<int32_t>(sizeof(T)) / 32;
+    const int32_t dstStride = (TileStep() - baseDim) * static_cast<int32_t>(sizeof(T)) / 32;
 
     const bool canUseCompactBatch =
         tokenCount > 1 && blockLen <= 65535 && srcStride <= 65535 && dstStride <= 65535;
     if (canUseCompactBatch) {
         const DataCopyParams copyParams{static_cast<uint16_t>(tokenCount), static_cast<uint16_t>(blockLen),
                                         static_cast<uint16_t>(srcStride), static_cast<uint16_t>(dstStride)};
-        DataCopy(ring[dstSlot * MAX_BLOCK_DIM], xGm[xOffset], copyParams);
+        DataCopy(ring[dstSlot * TileStep()], xGm[xOffset], copyParams);
     } else {
         for (int32_t i = 0; i < tokenCount; ++i) {
             const int64_t tokenOffset = static_cast<int64_t>(start + firstToken + i) * dim + channelStart;
-            DataCopy(ring[(dstSlot + i) * MAX_BLOCK_DIM], xGm[tokenOffset], baseDim);
+            DataCopy(ring[(dstSlot + i) * TileStep()], xGm[tokenOffset], baseDim);
         }
     }
     SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[dstSlot]);
@@ -751,7 +764,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::ProcessFnRollingToken(int32_t start,
                                                                   int32_t slotCurr, int32_t channelStart,
                                                                   int32_t baseDim, int32_t dim)
 {
-    auto cl = CalcBufLayout::FromCalcBuf(calcBuf);
+    auto cl = CalcBufLayout::FromCalcBuf(calcBuf, TileStep());
     LocalTensor<float> &weightF = cl.weightF;
     LocalTensor<float> &state2F = cl.biasF;
     LocalTensor<float> &state1F = cl.accF;
@@ -766,7 +779,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::ProcessFnRollingToken(int32_t start,
 #endif
 
     const int32_t outSlot = t & 1;
-    LocalTensor<T> outSlotT = outT[outSlot * MAX_BLOCK_DIM];
+    LocalTensor<T> outSlotT = outT[outSlot * TileStep()];
     if (t >= 2) {
         WaitFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
     }
@@ -775,12 +788,12 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::ProcessFnRollingToken(int32_t start,
     constexpr int32_t w0Idx = MAX_WIDTH - kTemplateWidth;
     if (hasActivation) {
         ComputeFnRollingTokenRegbase<T, kTemplateWidth, true>(
-            ring[slotCurr * MAX_BLOCK_DIM], weightF[w0Idx * MAX_BLOCK_DIM], state0F, state1F, state2F, outSlotT,
-            baseDim, MAX_BLOCK_DIM);
+            ring[slotCurr * TileStep()], weightF[w0Idx * TileStep()], state0F, state1F, state2F, outSlotT,
+            baseDim, TileStep());
     } else {
         ComputeFnRollingTokenRegbase<T, kTemplateWidth, false>(
-            ring[slotCurr * MAX_BLOCK_DIM], weightF[w0Idx * MAX_BLOCK_DIM], state0F, state1F, state2F, outSlotT,
-            baseDim, MAX_BLOCK_DIM);
+            ring[slotCurr * TileStep()], weightF[w0Idx * TileStep()], state0F, state1F, state2F, outSlotT,
+            baseDim, TileStep());
     }
     PipeBarrier<PIPE_V>();
 #else
@@ -906,7 +919,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackState(int32_t cacheIdx, int
         const int32_t tap = (width - 2) - pos;
         const int32_t slot = RetreatRingSlot(lastSlot, tap);
         const int64_t stateOffset = stateBaseOffset + static_cast<int64_t>(pos) * convStateStride1;
-        DataCopy(convStatesGm[stateOffset], ring[slot * MAX_BLOCK_DIM], baseDim);
+        DataCopy(convStatesGm[stateOffset], ring[slot * TileStep()], baseDim);
     }
 }
 
@@ -932,7 +945,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackFnState(int32_t seq, int32_
         const int64_t xOffset = static_cast<int64_t>(firstToken) * dim + channelStart;
         const int32_t blockLen = baseDim * static_cast<int32_t>(sizeof(T)) / 32;
         const int32_t srcStride = (dim - baseDim) * static_cast<int32_t>(sizeof(T)) / 32;
-        const int32_t dstStride = (MAX_BLOCK_DIM - baseDim) * static_cast<int32_t>(sizeof(T)) / 32;
+        const int32_t dstStride = (TileStep() - baseDim) * static_cast<int32_t>(sizeof(T)) / 32;
         if (historyCount > 1 && blockLen <= 65535 && srcStride <= 65535 && dstStride <= 65535) {
             const DataCopyParams copyParams{static_cast<uint16_t>(historyCount), static_cast<uint16_t>(blockLen),
                                             static_cast<uint16_t>(srcStride), static_cast<uint16_t>(dstStride)};
@@ -940,14 +953,14 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackFnState(int32_t seq, int32_
         } else {
             for (int32_t pos = 0; pos < historyCount; ++pos) {
                 const int64_t tokenOffset = static_cast<int64_t>(firstToken + pos) * dim + channelStart;
-                DataCopy(stateT[pos * MAX_BLOCK_DIM], xGm[tokenOffset], baseDim);
+                DataCopy(stateT[pos * TileStep()], xGm[tokenOffset], baseDim);
             }
         }
         hasGmCopy = true;
     } else {
         for (int32_t pos = 0; pos < historyCount; ++pos) {
             const int32_t relativeToken = seqLen - historyCount + pos;
-            LocalTensor<T> stateSlot = stateT[pos * MAX_BLOCK_DIM];
+            LocalTensor<T> stateSlot = stateT[pos * TileStep()];
             if (relativeToken >= 0) {
                 const int64_t xOffset = static_cast<int64_t>(seqStart + relativeToken) * dim + channelStart;
                 DataCopy(stateSlot, xGm[xOffset], baseDim);
@@ -984,7 +997,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackFnState(int32_t seq, int32_
     const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * tilingData_->convStateStride0 + channelStart;
     const int64_t dstGap = tilingData_->convStateStride1 - baseDim;
     const int32_t blockLen = baseDim * static_cast<int32_t>(sizeof(T)) / 32;
-    const int32_t srcStride = (MAX_BLOCK_DIM - baseDim) * static_cast<int32_t>(sizeof(T)) / 32;
+    const int32_t srcStride = (TileStep() - baseDim) * static_cast<int32_t>(sizeof(T)) / 32;
     constexpr int64_t elementsPerBlock = 32 / static_cast<int64_t>(sizeof(T));
     const int64_t dstStride = dstGap / elementsPerBlock;
     bool canBatchStateWrite = historyCount > 1 && blockLen <= 65535 && srcStride <= 65535 && dstGap >= 0 &&
@@ -1000,7 +1013,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackFnState(int32_t seq, int32_
     } else {
         for (int32_t pos = 0; pos < historyCount; ++pos) {
             const int64_t stateOffset = stateBaseOffset + static_cast<int64_t>(pos) * tilingData_->convStateStride1;
-            DataCopy(convStatesGm[stateOffset], stateT[pos * MAX_BLOCK_DIM], baseDim);
+            DataCopy(convStatesGm[stateOffset], stateT[pos * TileStep()], baseDim);
         }
     }
 }
@@ -1033,8 +1046,8 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackStateSpec(int32_t cacheIdx,
     }
 
     LocalTensor<T> ring = inBuf.Get<T>();
-    LocalTensor<T> buf0 = ring[0 * MAX_BLOCK_DIM];
-    LocalTensor<T> buf1 = ring[1 * MAX_BLOCK_DIM];
+    LocalTensor<T> buf0 = ring[0 * TileStep()];
+    LocalTensor<T> buf1 = ring[1 * TileStep()];
 
     if (hasInit) {
         const int32_t srcPos0 = stateTokenOffset + 1;
@@ -1231,7 +1244,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::ProcessDefaultByWindowMode()
     const uint32_t blockIdx = GetBlockIdx();
     const uint32_t blockNum = GetBlockNum();
 
-    if (baseDim <= 0 || baseDimCnt <= 0 || baseDim > MAX_BLOCK_DIM || width < 2 || width > MAX_WIDTH) {
+    if (baseDim <= 0 || baseDimCnt <= 0 || baseDim > MAX_TILE_STEP || width < 2 || width > MAX_WIDTH) {
         ReleaseEvents();
         return;
     }

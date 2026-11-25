@@ -20,7 +20,12 @@
 namespace NsCausalConv1dCommon {
 
 constexpr int32_t MAX_WIDTH = 4;
+// Absolute upper bound accepted from tiling; the FN per-core tile stride is
+// dynamic (tilingData->baseDim) and sized from the platform UB capacity.
+// UPDATE keeps the historical fixed stride so its hot path stays const-folded.
+constexpr int32_t MAX_TILE_STEP = 16384;
 constexpr int32_t MAX_BLOCK_DIM = 4096;
+constexpr int32_t TILE_STEP_ALIGN = 16;
 
 constexpr int32_t RING_SLOTS = 5;
 
@@ -48,15 +53,16 @@ struct CalcBufLayout {
 
     __aicore__ inline CalcBufLayout() = default;
 
-    __aicore__ static inline CalcBufLayout FromCalcBuf(AscendC::TBuf<AscendC::QuePosition::VECCALC> &calcBuf)
+    __aicore__ static inline CalcBufLayout FromCalcBuf(AscendC::TBuf<AscendC::QuePosition::VECCALC> &calcBuf,
+                                                       int32_t tileStep)
     {
         CalcBufLayout layout;
         AscendC::LocalTensor<float> calc = calcBuf.template Get<float>();
         layout.weightF = calc;
-        layout.biasF = calc[MAX_WIDTH * MAX_BLOCK_DIM];
-        layout.accF = layout.biasF[MAX_BLOCK_DIM];
-        layout.tmpF = layout.accF[MAX_BLOCK_DIM];
-        layout.currF = layout.tmpF[MAX_BLOCK_DIM];
+        layout.biasF = calc[MAX_WIDTH * tileStep];
+        layout.accF = layout.biasF[tileStep];
+        layout.tmpF = layout.accF[tileStep];
+        layout.currF = layout.tmpF[tileStep];
         return layout;
     }
 };

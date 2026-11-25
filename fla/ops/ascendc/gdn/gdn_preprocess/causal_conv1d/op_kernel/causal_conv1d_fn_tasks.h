@@ -107,12 +107,12 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRingSeqSplit(int32_t seq, int32_
     int64_t xHistoryOffset = static_cast<int64_t>(historyStartTok) * dim + channelStart;
 
     for (int32_t i = 0; i < ringStart; ++i) {
-        Duplicate(ring[i * MAX_BLOCK_DIM], static_cast<T>(0), baseDim);
+        Duplicate(ring[i * TileStep()], static_cast<T>(0), baseDim);
         hasVectorInit = true;
     }
 
     for (int32_t i = 0, srcTok = historyStartTok; i < historyCount; ++i, ++srcTok, xHistoryOffset += dim) {
-        LocalTensor<T> histSlot = ring[(ringStart + i) * MAX_BLOCK_DIM];
+        LocalTensor<T> histSlot = ring[(ringStart + i) * TileStep()];
         if (srcTok >= seqStart) {
             DataCopy(histSlot, xGm[xHistoryOffset], baseDim);
             hasGmHistoryCopy = true;
@@ -146,7 +146,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRingSeqSplit(int32_t seq, int32_
     if (tileLen > 0) {
         const int32_t slot0 = SlotCurr(0);
         const int64_t xOffset = static_cast<int64_t>(tileStart) * dim + channelStart;
-        DataCopy(ring[slot0 * MAX_BLOCK_DIM], xGm[xOffset], baseDim);
+        DataCopy(ring[slot0 * TileStep()], xGm[xOffset], baseDim);
         SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slot0]);
     }
 
@@ -203,7 +203,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::PrefetchInitStatesToWorkspace(
     const int32_t batch = tilingData_->batch;
     const bool hasCacheIndices = (tilingData_->hasCacheIndices != 0);
     const bool hasInitialState = (tilingData_->hasInitialState != 0);
-    LocalTensor<T> tmpBuf = inBuf.Get<T>()[0 * MAX_BLOCK_DIM];
+    LocalTensor<T> tmpBuf = inBuf.Get<T>()[0 * TileStep()];
 
     for (int32_t seq = ownerIndex; seq < batch; seq += ownerCount) {
         if (!ResolveSeqHasInit(seq, hasInitialState)) {

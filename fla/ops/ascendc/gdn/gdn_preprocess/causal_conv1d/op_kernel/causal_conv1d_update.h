@@ -51,7 +51,7 @@ public:
         const int32_t baseDimCnt = static_cast<int32_t>(tilingData->baseDimCnt);
         const int32_t width = static_cast<int32_t>(tilingData->width);
         const int32_t baseDim = static_cast<int32_t>(tilingData->baseDim);
-        if (baseDim <= 0 || baseDimCnt <= 0 || baseDim > MAX_BLOCK_DIM || width < 2 || width > MAX_WIDTH || dim <= 0 ||
+        if (baseDim <= 0 || baseDimCnt <= 0 || baseDim > MAX_TILE_STEP || width < 2 || width > MAX_WIDTH || dim <= 0 ||
             tilingData->batch <= 0) {
             this->ReleaseEvents();
             return;
