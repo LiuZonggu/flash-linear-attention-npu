@@ -22,10 +22,13 @@ namespace optiling::causal_conv1d_host {
 
 using namespace Ops::Transformer::OpTiling;
 
+inline int64_t ComputeFnUbLimitedBaseDim(uint64_t ubSize);
+
 inline DimTileChoice ChooseCanonicalUpdateBaseDimChoice(gert::TilingContext *context, int64_t batch, int64_t dim,
-                                                        uint32_t coreNum)
+                                                        uint32_t coreNum, uint64_t ubSize)
 {
     const int64_t candidates[] = {4096, 2048, 1024, 768, 512};
+    const int64_t ubLimitedBaseDim = ComputeFnUbLimitedBaseDim(ubSize);
 
     auto chooseOnce = [&](bool requireExactDiv) -> DimTileChoice {
         DimTileChoice bestOver;
@@ -33,7 +36,7 @@ inline DimTileChoice ChooseCanonicalUpdateBaseDimChoice(gert::TilingContext *con
         DimTileChoice bestUnder;
 
         for (int64_t baseDim : candidates) {
-            if (baseDim <= 0) {
+            if (baseDim <= 0 || baseDim > ubLimitedBaseDim) {
                 continue;
             }
             if (requireExactDiv && (dim % baseDim != 0)) {
@@ -98,13 +101,12 @@ inline int64_t ComputeFnUbLimitedBaseDim(uint64_t ubSize)
     const int64_t bytesPerElem = (RING_SLOT_CNT * BF16_FP16_ELEM_BYTES) + (FN_OUT_SLOT_CNT * BF16_FP16_ELEM_BYTES) +
                                  (FN_CALC_FP32_SLOT_CNT * static_cast<int64_t>(sizeof(float)));
     const int64_t budgetBytes = static_cast<int64_t>(ubSize) - FN_UB_RESERVED_BYTES;
-    const int64_t ubLimitedBaseDim = AlignDownInt64(budgetBytes / bytesPerElem, DIM_ALIGN_ELEMS);
-    return std::min<int64_t>(MAX_DIM_TILE_SIZE, ubLimitedBaseDim);
+    return AlignDownInt64(budgetBytes / bytesPerElem, DIM_ALIGN_ELEMS);
 }
 
-inline DimTileChoice ChooseFnTokenFirstBaseDimChoice(int64_t dim)
+inline DimTileChoice ChooseFnTokenFirstBaseDimChoice(int64_t dim, int64_t maxBaseDim)
 {
-    if (dim <= 0 || dim > MAX_DIM_TILE_SIZE) {
+    if (dim <= 0 || dim > maxBaseDim) {
         return {};
     }
     return {dim, 1, 1};
@@ -113,7 +115,7 @@ inline DimTileChoice ChooseFnTokenFirstBaseDimChoice(int64_t dim)
 inline DimTileChoice ChooseFnTokenDimCoSplitBaseDimChoice(gert::TilingContext *context, int64_t dim, uint64_t ubSize,
                                                           uint32_t coreNum)
 {
-    if (dim <= 0) {
+    if (dim <= 0 || coreNum == 0) {
         return {};
     }
 
@@ -276,10 +278,18 @@ inline FnHostPlan ChooseFnHostPlan(gert::TilingContext *context, const CausalCon
         return plan;
     }
 
-    if (tiling.dim <= MAX_DIM_TILE_SIZE) {
+    // The per-core tile stride is sized from the platform UB capacity, so the
+    // single-column fast path is available up to that dynamic limit instead of
+    // a fixed 4096.
+    const int64_t maxBaseDim = ComputeFnUbLimitedBaseDim(ubSize);
+    if (maxBaseDim <= 0) {
+        return plan;
+    }
+
+    if (tiling.dim <= maxBaseDim) {
         plan.caseKind = FN_TILING_CASE_TOKEN_FIRST;
         plan.executionPlan = FN_EXECUTION_PLAN_CUTBS;
-        plan.baseDimChoice = ChooseFnTokenFirstBaseDimChoice(tiling.dim);
+        plan.baseDimChoice = ChooseFnTokenFirstBaseDimChoice(tiling.dim, maxBaseDim);
     } else {
         plan.caseKind = FN_TILING_CASE_TOKEN_DIM_CO_SPLIT;
         plan.executionPlan = FN_EXECUTION_PLAN_CUTBSD;

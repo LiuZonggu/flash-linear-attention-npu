@@ -78,7 +78,7 @@ static ge::graphStatus CausalConv1dTilingFunc(gert::TilingContext *context)
         baseDimChoice = fnHostPlan.baseDimChoice;
         fnExecutionPlan = fnHostPlan.executionPlan;
     } else {
-        baseDimChoice = ChooseCanonicalUpdateBaseDimChoice(context, tiling->batch, tiling->dim, coreNum);
+        baseDimChoice = ChooseCanonicalUpdateBaseDimChoice(context, tiling->batch, tiling->dim, coreNum, ubSize);
     }
 
     if (baseDimChoice.baseDim <= 0 || baseDimChoice.baseDimCnt <= 0 || baseDimChoice.gridSize <= 0) {
